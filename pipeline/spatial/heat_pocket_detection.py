@@ -4,7 +4,6 @@ import traceback
 
 import numpy as np
 import rasterio
-from rasterio.mask import mask
 from scipy import ndimage
 import pandas as pd
 
@@ -55,13 +54,9 @@ def read_lst(path):
     with rasterio.open(path) as src:
 
         lst = src.read(1).astype(np.float32)
-
         profile = src.profile.copy()
-
         transform = src.transform
-
         crs = src.crs
-
         nodata = src.nodata
 
     return (
@@ -84,7 +79,6 @@ def calculate_threshold(lst):
     ]
 
     if valid_lst.size == 0:
-
         raise ValueError(
             "No valid LST pixels found."
         )
@@ -283,7 +277,6 @@ def calculate_pocket_statistics(
         else:
 
             mean_lst = np.nan
-
             max_lst = np.nan
 
         records.append(
@@ -713,15 +706,64 @@ def process_scene(scene_date):
 
 
 # ============================================================
+# LOAD EXISTING MASTER SUMMARY
+# ============================================================
+
+def load_existing_summary():
+    """
+    Load the existing master summary if it exists.
+
+    This prevents already-processed scenes from being
+    recalculated unnecessarily while allowing missing
+    scene summaries to be repaired.
+    """
+
+    summary_path = (
+        HEAT_POCKETS_OUTPUT_DIR
+        / "heat_pocket_summary.csv"
+    )
+
+    if not summary_path.exists():
+        return {}
+
+    dataframe = pd.read_csv(
+        summary_path
+    )
+
+    if dataframe.empty:
+        return {}
+
+    dataframe["date"] = (
+        dataframe["date"]
+        .astype(str)
+    )
+
+    # Keep the latest occurrence if duplicates exist.
+    dataframe = dataframe.drop_duplicates(
+        subset=["date"],
+        keep="last"
+    )
+
+    return {
+        row["date"]: row
+        for row in dataframe.to_dict(
+            orient="records"
+        )
+    }
+
+
+# ============================================================
 # BATCH PROCESSING
 # ============================================================
 
 def process_all_scenes():
 
     print("=" * 70)
+
     print(
         "BATCH HEAT-POCKET DETECTION"
     )
+
     print("=" * 70)
 
     # Find all processed Landsat scene folders.
@@ -748,12 +790,27 @@ def process_all_scenes():
     )
 
     successful = []
-
     skipped = []
-
+    repaired = []
     failed = []
-
     summaries = []
+
+    # --------------------------------------------------------
+    # Load existing master summary
+    # --------------------------------------------------------
+
+    existing_summary = (
+        load_existing_summary()
+    )
+
+    print(
+        f"Existing master-summary rows: "
+        f"{len(existing_summary)}"
+    )
+
+    # --------------------------------------------------------
+    # Process every scene
+    # --------------------------------------------------------
 
     for index, scene_dir in enumerate(
         scene_dirs,
@@ -777,27 +834,98 @@ def process_all_scenes():
         )
 
         # ----------------------------------------------------
-        # Skip completed scenes
+        # Existing outputs
         # ----------------------------------------------------
 
         if outputs_exist(
             scene_date
         ):
 
+            # If the scene already has a master-summary
+            # entry, reuse it without recalculating.
+            if scene_date in existing_summary:
+
+                print(
+                    "\nSKIPPING: "
+                    "heat-pocket outputs and "
+                    "master-summary entry already exist."
+                )
+
+                skipped.append(
+                    scene_date
+                )
+
+                summaries.append(
+                    existing_summary[
+                        scene_date
+                    ]
+                )
+
+                continue
+
+            # If outputs exist but the scene is missing
+            # from the master summary, repair only this scene.
             print(
-                "\nSKIPPING: "
-                "heat-pocket outputs "
-                "already exist."
+                "\nEXISTING OUTPUTS FOUND, "
+                "BUT MASTER-SUMMARY ENTRY IS MISSING."
             )
 
-            skipped.append(
-                scene_date
+            print(
+                "Recalculating this scene's "
+                "summary only..."
             )
+
+            try:
+
+                summary = process_scene(
+                    scene_date
+                )
+
+                skipped.append(
+                    scene_date
+                )
+
+                repaired.append(
+                    scene_date
+                )
+
+                summaries.append(
+                    summary
+                )
+
+            except Exception as exc:
+
+                print(
+                    "\n"
+                    + "!" * 70
+                )
+
+                print(
+                    f"FAILED TO REPAIR: "
+                    f"{scene_date}"
+                )
+
+                print(
+                    f"Error: {exc}"
+                )
+
+                print(
+                    "!" * 70
+                )
+
+                traceback.print_exc()
+
+                failed.append(
+                    (
+                        scene_date,
+                        str(exc)
+                    )
+                )
 
             continue
 
         # ----------------------------------------------------
-        # Process scene
+        # Process new scene
         # ----------------------------------------------------
 
         try:
@@ -854,6 +982,22 @@ def process_all_scenes():
             )
         )
 
+        # Ensure dates are strings and remove duplicates.
+        summary_dataframe["date"] = (
+            summary_dataframe["date"]
+            .astype(str)
+        )
+
+        summary_dataframe = (
+            summary_dataframe
+            .drop_duplicates(
+                subset=["date"],
+                keep="last"
+            )
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+
         summary_path = (
             HEAT_POCKETS_OUTPUT_DIR
             / "heat_pocket_summary.csv"
@@ -870,6 +1014,16 @@ def process_all_scenes():
 
         print(
             summary_path
+        )
+
+        print(
+            f"\nMaster summary rows: "
+            f"{len(summary_dataframe)}"
+        )
+
+        print(
+            f"Unique dates: "
+            f"{summary_dataframe['date'].nunique()}"
         )
 
     # ========================================================
@@ -905,17 +1059,22 @@ def process_all_scenes():
     )
 
     print(
+        f"Master-summary entries repaired: "
+        f"{len(repaired)}"
+    )
+
+    print(
         f"Failed: "
         f"{len(failed)}"
     )
 
-    if skipped:
+    if repaired:
 
         print(
-            "\nSkipped scenes:"
+            "\nRepaired scenes:"
         )
 
-        for scene_date in skipped:
+        for scene_date in repaired:
 
             print(
                 f"  - {scene_date}"
